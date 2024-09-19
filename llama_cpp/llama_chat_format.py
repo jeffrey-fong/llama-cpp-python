@@ -1366,7 +1366,7 @@ def format_gemma(
 # Tricky chat formats that require custom chat handlers
 
 
-@register_chat_completion_handler("functionary")
+@register_chat_completion_handler("functionary-legacy")
 def functionary_chat_handler(
     llama: llama.Llama,
     messages: List[llama_types.ChatCompletionRequestMessage],
@@ -1724,8 +1724,7 @@ def functionary_chat_handler(
     )
 
 
-@register_chat_completion_handler("functionary-v1")
-@register_chat_completion_handler("functionary-v2")
+@register_chat_completion_handler("functionary")
 def functionary_v1_v2_chat_handler(
     llama: llama.Llama,
     messages: List[llama_types.ChatCompletionRequestMessage],
@@ -1754,227 +1753,76 @@ def functionary_v1_v2_chat_handler(
     grammar: Optional[llama.LlamaGrammar] = None,
     **kwargs,  # type: ignore
 ) -> Union[llama_types.ChatCompletion, Iterator[llama_types.ChatCompletionChunk]]:
-    SYSTEM_MESSAGE = """A chat between a curious user and an artificial intelligence assistant. The assistant gives helpful, detailed, and polite answers to the user's questions. The assistant calls functions with appropriate input when necessary"""
 
     tokenizer = llama.tokenizer_
-    assert hasattr(
-        tokenizer, "hf_tokenizer"
-    ), "Please provide a valid hf_tokenizer_path from https://huggingface.co/meetkai when initializing the Llama class"
-    from transformers import AutoTokenizer
+    chat_template = llama.metadata["tokenizer.chat_template"]
+    template_renderer = ImmutableSandboxedEnvironment(
+        undefined=jinja2.StrictUndefined,
+    ).from_string(chat_template)
 
-    if "<|START_OF_FUNCTION_CALL|>" in tokenizer.hf_tokenizer.additional_special_tokens:
-        version = "v1"
-        END_SYSTEM_TOKEN = "<|END_OF_SYSTEM|>"
-        END_USER_TOKEN = "<|END_OF_USER|>"
-        END_ASSISTANT_TOKEN = "<|END_OF_ASSISTANT|>"
-        END_FUNCTION_RESULT_TOKEN = "<|END_OF_FUNCTION_RESULT|>"
-        START_FUNCTION_CALL_TOKEN = "<|START_OF_FUNCTION_CALL|>"
-        END_FUNCTION_CALL_TOKEN = "<|END_OF_FUNCTION_CALL|>"
-    else:
-        version = "v2"
-        RECIPIENT_TOKEN = "<|recipient|>"
-        FROM_TOKEN = "<|from|>"
-        STOP_TOKEN = "<|stop|>"
-        CONTENT_TOKEN = "<|content|>"
+    # if "<|START_OF_FUNCTION_CALL|>" in tokenizer.hf_tokenizer.additional_special_tokens:
+    #     version = "v1"
+    #     END_SYSTEM_TOKEN = "<|END_OF_SYSTEM|>"
+    #     END_USER_TOKEN = "<|END_OF_USER|>"
+    #     END_ASSISTANT_TOKEN = "<|END_OF_ASSISTANT|>"
+    #     END_FUNCTION_RESULT_TOKEN = "<|END_OF_FUNCTION_RESULT|>"
+    #     START_FUNCTION_CALL_TOKEN = "<|START_OF_FUNCTION_CALL|>"
+    #     END_FUNCTION_CALL_TOKEN = "<|END_OF_FUNCTION_CALL|>"
+    # else:
+    #     version = "v2"
+    #     RECIPIENT_TOKEN = "<|recipient|>"
+    #     FROM_TOKEN = "<|from|>"
+    #     STOP_TOKEN = "<|stop|>"
+    #     CONTENT_TOKEN = "<|content|>"
 
-    def generate_type_definition(
-        param: Dict[str, llama_types.JsonType], indent_level: int, shared_defs
-    ) -> str:
-        indent = "  " * indent_level
-        if "$ref" in param:
-            # Reference to a shared definition
-            ref_name = param["$ref"].split("/")[
-                -1
-            ]  # Extract the type name from the reference
-            return ref_name
-        elif param.get("type") == "array":
-            items = param.get("items", {})
-            item_type = generate_type_definition(items, indent_level + 1, shared_defs)
-            return f"Array<{item_type}>"
-        elif param.get("type") == "object":
-            properties = param.get("properties", {})
-            nested_schema = "{\n"
-            for nested_param_name, nested_param in properties.items():
-                nested_param_type = generate_type_definition(
-                    nested_param, indent_level + 1, shared_defs
-                )
-                nested_schema += (
-                    f"{indent}  {nested_param_name}: {nested_param_type},\n"
-                )
-            nested_schema += indent + "}"
-            return nested_schema
-        elif "enum" in param:
-            # Enum type
-            return " | ".join([f'"{enum_value}"' for enum_value in param["enum"]])
-        else:
-            # Simple type
-            return param.get("type", "any")
+    # Convert legacy functions to tools
+    if functions is not None:
+        tools = [{"type": "function", "function": function} for function in functions]
 
-    def generate_shared_definitions(shared_defs, indent_level: int) -> str:
-        indent = "  " * indent_level
-        shared_definitions = ""
-        for def_name, def_properties in shared_defs.items():
-            shared_definitions += f"{indent}type {def_name} = "
-            if def_properties.get("type") == "object":
-                shared_definitions += generate_type_definition(
-                    def_properties, indent_level, shared_defs
-                )
-            elif "enum" in def_properties:
-                # Enum type
-                shared_definitions += " | ".join(
-                    [f'"{enum_value}"' for enum_value in def_properties["enum"]]
-                )
-            shared_definitions += ";\n"
-        return shared_definitions
+    # Convert legacy function_call to tool_choice
+    if function_call is not None:
+        if isinstance(function_call, str) and (
+            function_call == "none" or function_call == "auto"
+        ):
+            tool_choice = function_call
+        if isinstance(function_call, dict) and "name" in function_call:
+            tool_choice = {"type": "function", "function": {"name": function_call["name"]}}
 
-    def generate_schema_from_functions(functions, namespace="functions") -> str:
-        schema = (
-            "// Supported function definitions that should be called when necessary.\n"
-        )
-        schema += f"namespace {namespace} {{\n\n"
-
-        # Generate shared definitions
-        shared_definitions = {}
-        for function in functions:
-            parameters = function.get("parameters", {})
-            shared_definitions.update(parameters.get("$defs", {}))
-
-        schema += generate_shared_definitions(shared_definitions, 1)
-
-        for function in functions:
-            function_name = function["name"]
-            description = function.get("description", "")
-            parameters = function.get("parameters", {})
-            required_params = parameters.get("required", [])
-
-            schema += f"// {description}\n"
-            schema += f"type {function_name} = (_: {{\n"
-
-            for param_name, param in parameters.get("properties", {}).items():
-                param_description = param.get("description", "")
-                param_type = generate_type_definition(param, 2, shared_definitions)
-                optional_indicator = "" if param_name in required_params else "?"
-                schema += f"// {param_description}\n"
-                schema += f"{param_name}{optional_indicator}: {param_type},\n"
-            schema += "}) => any;\n\n"
-
-        schema += "}} // namespace {}".format(namespace)
-        return schema
-
-    def prepare_messages_for_inference(
-        messages: List[llama_types.ChatCompletionRequestMessage],
-        tokenizer: AutoTokenizer,
-        version: Literal["v1", "v2"],
-        functions: Optional[List[llama_types.ChatCompletionFunctions]] = None,
-        tools: Optional[List[llama_types.ChatCompletionTool]] = None,
-        tool_choice: Union[Dict, str] = "auto",
-    ):
-        all_messages: List[llama_types.ChatCompletionRequestMessage] = []
-        if tool_choice == "none":
-            all_messages.append(
-                llama_types.ChatCompletionRequestSystemMessage(
-                    role="system", content=generate_schema_from_functions([])
-                )
-            )
-        else:
-            if functions is not None:
-                all_messages.append(
-                    llama_types.ChatCompletionRequestSystemMessage(
-                        role="system", content=generate_schema_from_functions(functions)
-                    )
-                )
-            elif tools is not None and tool_choice != "none":
-                all_messages.append(
-                    llama_types.ChatCompletionRequestSystemMessage(
-                        role="system",
-                        content=generate_schema_from_functions(
-                            [
-                                tool["function"]
-                                for tool in tools
-                                if tool["type"] == "function"
-                            ]
-                        ),
-                    )
-                )
-
-        all_messages.append(
-            llama_types.ChatCompletionRequestSystemMessage(
-                role="system", content=SYSTEM_MESSAGE
-            )
-        )
-
-        for message in messages:
-            # Function call responses
-            if message["role"] == "function" and "name" in message:
-                message["name"] = f"functions.{message['name']}"
-            # Function call requests by assistant
-            if "function_call" in message:
-                message["function_call"][
-                    "name"
-                ] = f"functions.{message['function_call']['name']}"
-            all_messages.append(message)
-
-        if version == "v1":
-            suffix = "assistant:\n"
-        else:
-            suffix = "<|from|>assistant\n<|recipient|>"
-
-        return (
-            tokenizer.hf_tokenizer.apply_chat_template(all_messages, tokenize=False)
-            + suffix
-        )
-
-    if tools is not None:
-        functions = [tool["function"] for tool in tools if tool["type"] == "function"]
-
-    if tool_choice is not None:
-        function_call = (
-            tool_choice if isinstance(tool_choice, str) else tool_choice["function"]
-        )
-    elif function_call is not None:
-        pass
-    else:
-        function_call = "auto"
-
-    prompt = prepare_messages_for_inference(
-        messages, tokenizer, version, functions, tools, function_call
+    prompt = template_renderer.render(
+        messages=messages,
+        tools=tools,
+        bos_token="",
+        add_generation_prompt=True,
     )
-
-    # If no tools/functions are provided
-    if function_call == "none" or functions is None or len(functions) == 0:
-        if version == "v1":
-            stop = END_ASSISTANT_TOKEN
-        else:
-            stop = STOP_TOKEN
-            prompt += "all\n<|content|>"
-
-        completion_or_completion_chunks = llama.create_completion(
-            prompt=prompt,
-            temperature=temperature,
-            top_p=top_p,
-            top_k=top_k,
-            min_p=min_p,
-            typical_p=typical_p,
-            stream=stream,
-            stop=stop,
-            max_tokens=max_tokens,
-            presence_penalty=presence_penalty,
-            frequency_penalty=frequency_penalty,
-            repeat_penalty=repeat_penalty,
-            tfs_z=tfs_z,
-            mirostat_mode=mirostat_mode,
-            mirostat_tau=mirostat_tau,
-            mirostat_eta=mirostat_eta,
-            model=model,
-            logits_processor=logits_processor,
-            grammar=grammar,
+    
+    def create_completion(prompt, stop, grammar):
+        completion = cast(
+            llama_types.Completion,
+            llama.create_completion(
+                prompt=prompt,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                min_p=min_p,
+                typical_p=typical_p,
+                stream=stream,
+                stop=stop,
+                max_tokens=max_tokens,
+                presence_penalty=presence_penalty,
+                frequency_penalty=frequency_penalty,
+                repeat_penalty=repeat_penalty,
+                tfs_z=tfs_z,
+                mirostat_mode=mirostat_mode,
+                mirostat_tau=mirostat_tau,
+                mirostat_eta=mirostat_eta,
+                model=model,
+                logits_processor=logits_processor,
+                grammar=grammar,
+            ),
         )
-        if stream is False:
-            completion_or_completion_chunks["choices"][0]["text"] = (
-                completion_or_completion_chunks["choices"][0]["text"].lstrip()
-            )
-        return _convert_completion_to_chat(completion_or_completion_chunks, stream=stream)  # type: ignore
 
+        return completion
+    
     def get_grammar(function_call):
         function_body = None
         for function in functions or []:
@@ -2007,34 +1855,25 @@ def functionary_v1_v2_chat_handler(
                 )
 
         return grammar
+    
+    # Case 1: No tools/functions are provided
+    if (
+        (isinstance(tool_choice, str) and tool_choice == "none")
+        or tools is None
+        or len(tools) == 0
+    ):
+        suffix_mapping = {"<|recipient|>": "all\n<|content|>", ">>>": "all\n"}
+        stop = ["<|eot_id|>", "<function", ">>>", "<|reserved_special_token_249|>", "<|stop|>", "<|from|>"]
+        for key, suffix in suffix_mapping.items():
+            if prompt.endswith(key):
+                prompt += suffix
 
-    def create_completion(prompt, stop, grammar):
-        completion = cast(
-            llama_types.Completion,
-            llama.create_completion(
-                prompt=prompt,
-                temperature=temperature,
-                top_p=top_p,
-                top_k=top_k,
-                min_p=min_p,
-                typical_p=typical_p,
-                stream=stream,
-                stop=stop,
-                max_tokens=max_tokens,
-                presence_penalty=presence_penalty,
-                frequency_penalty=frequency_penalty,
-                repeat_penalty=repeat_penalty,
-                tfs_z=tfs_z,
-                mirostat_mode=mirostat_mode,
-                mirostat_tau=mirostat_tau,
-                mirostat_eta=mirostat_eta,
-                model=model,
-                logits_processor=logits_processor,
-                grammar=grammar,
-            ),
-        )
-
-        return completion
+        completion_or_completion_chunks = create_completion(prompt, stop, None)
+        if stream is False:
+            completion_or_completion_chunks["choices"][0]["text"] = (
+                completion_or_completion_chunks["choices"][0]["text"].lstrip()
+            )
+        return _convert_completion_to_chat(completion_or_completion_chunks, stream=stream)  # type: ignore
 
     content = ""
     function_calls, function_bodies = [], []
@@ -2434,6 +2273,16 @@ def functionary_v1_v2_chat_handler(
             tools=tools, functions=functions, function_call=function_call, prompt=prompt
         )
     else:
+        # Case 2: Tool choice by user
+        if isinstance(tool_choice, dict):
+            tool_name = tool_choice["function"]["name"]
+            tool = next(
+                (tool for tool in tools if tool["function"]["name"] == tool_name), None
+            )
+            if tool is None:
+                raise ValueError(f"Tool with name '{tool_name}' not found in tools")
+            # suffix_mapping = {"<|recipient|>": f"{tool_name}\n<|content|>", ">>>": f"{tool_name}\n", ""}
+            breakpoint()
         if version == "v1":
             # If no or "auto" tool_choice/function_call
             if isinstance(function_call, str) and function_call == "auto":
