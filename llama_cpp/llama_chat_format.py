@@ -7,7 +7,9 @@ import ctypes
 import dataclasses
 import random
 import string
+import re
 
+from abc import ABC, abstractmethod
 from contextlib import ExitStack
 from typing import (
     Any,
@@ -1722,10 +1724,56 @@ def functionary_chat_handler(
         ],
         usage=completion["usage"],
     )
+    
+class FunctionaryChatManager(ABC):
+    def __init__(self, **kwargs):
+        for key, value in kwargs.items():
+            setattr(self, key, value)
+    
+    @abstractmethod
+    def get_tool_choice_prefix(self, tool_choice: Optional[Union[Literal["auto", "none", "required"], Dict[str, str]]]) -> str:
+        raise NotImplementedError
+    
+    @abstractmethod
+    def get_stop_tokens(self) -> List[str]:
+        raise NotImplementedError
+    
+    @abstractmethod
+    def get_generation_grammar(self, tool_names: str, is_required: bool) -> str:
+        raise NotImplementedError
+    
+    @abstractmethod
+    def parse_completion_text(self, completion_text: str) -> str:
+        raise NotImplementedError
+
+
+class FunctionaryV3ChatManager(FunctionaryChatManager):
+    def get_tool_choice_prefix(self, tool_choice: Optional[Union[Literal["auto", "none", "required"], Dict[str, str]]]) -> str:
+        mapping = {"auto": "", "none": "all\n", "required": "", None: ""}
+        return f"{tool_choice['function']['name']}\n" if isinstance(tool_choice, Dict) else mapping[tool_choice]
+    
+    def get_stop_tokens(self) -> List[str]:
+        return ["<|eot_id|>", ">>>"]
+    
+    def get_generation_grammar(self, tool_names: str, is_required: bool) -> str:
+        if is_required:
+            return (
+                f"root ::= functions\nfunctions ::= {tool_names}\n"
+            )
+        else:
+            return (
+                f"root ::= functions | freetext\nfunctions ::= {tool_names}\nfreetext ::= \"all\n\" [^\0]*\n"
+            )
+
+    def parse_completion_text(self, completion_text: str) -> Union[str, Dict[str, str]]:
+        if completion_text.startswith("all\n"):
+            return completion_text[len("all\n"):]
+        else:
+            return {"name": completion_text[:-1]}
 
 
 @register_chat_completion_handler("functionary")
-def functionary_v1_v2_chat_handler(
+def functionary_new_chat_handler(
     llama: llama.Llama,
     messages: List[llama_types.ChatCompletionRequestMessage],
     functions: Optional[List[llama_types.ChatCompletionFunction]] = None,
@@ -1754,26 +1802,28 @@ def functionary_v1_v2_chat_handler(
     **kwargs,  # type: ignore
 ) -> Union[llama_types.ChatCompletion, Iterator[llama_types.ChatCompletionChunk]]:
 
-    tokenizer = llama.tokenizer_
     chat_template = llama.metadata["tokenizer.chat_template"]
     template_renderer = ImmutableSandboxedEnvironment(
         undefined=jinja2.StrictUndefined,
     ).from_string(chat_template)
+    
+    def get_chat_manager(version: str):
+        chat_manager_mapping = {
+            "v3.llama3": FunctionaryV3ChatManager
+        }
+        chat_manager_cls = chat_manager_mapping.get(version, None)
+        
+        if chat_manager_cls is None:
+            raise ValueError(f"Invalid or missing template version in Jinja chat template. Please use the official ones from https://huggingface.co/meetkai")
+        
+        return chat_manager_cls()
 
-    # if "<|START_OF_FUNCTION_CALL|>" in tokenizer.hf_tokenizer.additional_special_tokens:
-    #     version = "v1"
-    #     END_SYSTEM_TOKEN = "<|END_OF_SYSTEM|>"
-    #     END_USER_TOKEN = "<|END_OF_USER|>"
-    #     END_ASSISTANT_TOKEN = "<|END_OF_ASSISTANT|>"
-    #     END_FUNCTION_RESULT_TOKEN = "<|END_OF_FUNCTION_RESULT|>"
-    #     START_FUNCTION_CALL_TOKEN = "<|START_OF_FUNCTION_CALL|>"
-    #     END_FUNCTION_CALL_TOKEN = "<|END_OF_FUNCTION_CALL|>"
-    # else:
-    #     version = "v2"
-    #     RECIPIENT_TOKEN = "<|recipient|>"
-    #     FROM_TOKEN = "<|from|>"
-    #     STOP_TOKEN = "<|stop|>"
-    #     CONTENT_TOKEN = "<|content|>"
+    version_match = re.search(r'\{#\s*version=(v\d+(?:\.\w+)*)\s*#\}', chat_template)
+    template_version = version_match.group(1) if version_match else None
+    if template_version:        
+        chat_manager = get_chat_manager(version=template_version)
+    else:
+        raise NotImplementedError("Invalid or missing template version in Jinja chat template. Please use the official ones from https://huggingface.co/meetkai")
 
     # Convert legacy functions to tools
     if functions is not None:
@@ -1789,13 +1839,12 @@ def functionary_v1_v2_chat_handler(
             tool_choice = {"type": "function", "function": {"name": function_call["name"]}}
 
     prompt = template_renderer.render(
-        messages=messages,
-        tools=tools,
-        bos_token="",
-        add_generation_prompt=True,
+        messages=messages, tools=tools, bos_token="", add_generation_prompt=True
     )
+    prompt += chat_manager.get_tool_choice_prefix(tool_choice)
+    stop = chat_manager.get_stop_tokens()
     
-    def create_completion(prompt, stop, grammar):
+    def create_completion(prompt, stop, grammar, max_tokens=max_tokens):
         completion = cast(
             llama_types.Completion,
             llama.create_completion(
@@ -1823,26 +1872,12 @@ def functionary_v1_v2_chat_handler(
 
         return completion
     
-    def get_grammar(function_call):
-        function_body = None
-        for function in functions or []:
-            if function["name"] == function_call:
-                function_body = function["parameters"]
-                break
-        for tool in tools or []:
-            if tool["type"] == "function" and tool["function"]["name"] == function_call:
-                function_body = tool["function"]["parameters"]
-                break
-
+    def get_json_grammar(json_schema):
         try:
             with suppress_stdout_stderr(disable=llama.verbose):
-                grammar_text = llama_grammar.json_schema_to_gbnf(
-                    json.dumps(function_body)
-                )
                 grammar = llama_grammar.LlamaGrammar.from_string(
-                    llama_grammar.json_schema_to_gbnf(json.dumps(function_body))
+                    llama_grammar.json_schema_to_gbnf(json.dumps(json_schema))
                 )
-                print(grammar_text)
         except Exception as e:
             if llama.verbose:
                 print(
@@ -1862,12 +1897,6 @@ def functionary_v1_v2_chat_handler(
         or tools is None
         or len(tools) == 0
     ):
-        suffix_mapping = {"<|recipient|>": "all\n<|content|>", ">>>": "all\n"}
-        stop = ["<|eot_id|>", "<function", ">>>", "<|reserved_special_token_249|>", "<|stop|>", "<|from|>"]
-        for key, suffix in suffix_mapping.items():
-            if prompt.endswith(key):
-                prompt += suffix
-
         completion_or_completion_chunks = create_completion(prompt, stop, None)
         if stream is False:
             completion_or_completion_chunks["choices"][0]["text"] = (
@@ -1876,7 +1905,7 @@ def functionary_v1_v2_chat_handler(
         return _convert_completion_to_chat(completion_or_completion_chunks, stream=stream)  # type: ignore
 
     content = ""
-    function_calls, function_bodies = [], []
+    tool_calls = []
     completion_tokens = 0
 
     def generate_streaming(tools, functions, function_call, prompt):
@@ -2272,207 +2301,112 @@ def functionary_v1_v2_chat_handler(
         return generate_streaming(
             tools=tools, functions=functions, function_call=function_call, prompt=prompt
         )
+    # Case 2: Tool choice by user
+    if isinstance(tool_choice, dict):
+        tool_name = tool_choice["function"]["name"]
+        tool = next(
+            (tool for tool in tools if tool["function"]["name"] == tool_name), None
+        )
+        if tool is None:
+            raise ValueError(f"Tool with name '{tool_name}' not found in tools")
+        grammar = get_json_grammar(json_schema=tool["function"]["parameters"])
+        completion = create_completion(prompt=prompt, stop=stop, grammar=grammar)
+        completion_text = completion["choices"][0]["text"]
+        completion_tokens += completion["usage"]["completion_tokens"]
+        tool_calls.append({"name": tool_name, "arguments": completion_text})
+    # Case 3: Automatic tool choice or tool_choice is required
     else:
-        # Case 2: Tool choice by user
-        if isinstance(tool_choice, dict):
-            tool_name = tool_choice["function"]["name"]
-            tool = next(
-                (tool for tool in tools if tool["function"]["name"] == tool_name), None
+        assert tool_choice is None or (isinstance(tool_choice, str) and tool_choice in ["auto", "required"])
+        while True:
+            # Generate function name first
+            tool_names = " | ".join(
+                [f'''"{tool['function']['name']}\n"''' for tool in tools]
             )
-            if tool is None:
-                raise ValueError(f"Tool with name '{tool_name}' not found in tools")
-            # suffix_mapping = {"<|recipient|>": f"{tool_name}\n<|content|>", ">>>": f"{tool_name}\n", ""}
-            breakpoint()
-        if version == "v1":
-            # If no or "auto" tool_choice/function_call
-            if isinstance(function_call, str) and function_call == "auto":
-                stops = ["\n", END_ASSISTANT_TOKEN]
-            # If tool_choice/function_call is provided
-            elif isinstance(function_call, dict):
-                prompt += f"{START_FUNCTION_CALL_TOKEN}{function_call['name']}:\n"
-                stops = END_FUNCTION_CALL_TOKEN
-                function_call = function_call["name"]
-                function_calls.append(function_call)
-                grammar = get_grammar(function_call)
-            else:
-                prompt = prompt
-                stops = ["\n", END_ASSISTANT_TOKEN]
-
-            completion = create_completion(prompt=prompt, stop=stops, grammar=grammar)
+            grammar = chat_manager.get_generation_grammar(tool_names=tool_names, is_required=tool_choice)
+            completion = create_completion(
+                prompt=prompt,
+                stop=stop,
+                grammar=llama_grammar.LlamaGrammar.from_string(grammar, verbose=llama.verbose)
+            )
             completion_text = completion["choices"][0]["text"]
             completion_tokens += completion["usage"]["completion_tokens"]
-
-            # If the generation does not involve a function call
-            if (
-                START_FUNCTION_CALL_TOKEN not in prompt
-                and START_FUNCTION_CALL_TOKEN not in completion_text
-            ):
-                completion["usage"]["completion_tokens"] = completion_tokens
-                return _convert_completion_to_chat(completion, stream=stream)  # type: ignore
-            # If the generation involves a function call in completion, generate the parameters
-            elif (
-                START_FUNCTION_CALL_TOKEN not in prompt
-                and START_FUNCTION_CALL_TOKEN in completion_text
-            ):
-                prompt += (
-                    completion_text.replace(
-                        f"{START_FUNCTION_CALL_TOKEN} ", START_FUNCTION_CALL_TOKEN
-                    )
-                    + "\n"
-                )
-                function_calls.append(
-                    completion_text.split(START_FUNCTION_CALL_TOKEN)[-1][:-1].strip()
-                )
-                grammar = get_grammar(function_calls[-1])
-                completion = create_completion(
-                    prompt=prompt, stop=END_FUNCTION_CALL_TOKEN, grammar=grammar
-                )
-                completion_tokens += completion["usage"]["completion_tokens"]
-                function_bodies.append(completion["choices"][0]["text"].strip())
-            # If the prompt involves a function call, just append generated parameters to function_bodies
+            output = chat_manager.parse_completion_text(completion_text)
+            prompt += completion_text
+            if isinstance(output, str):
+                content += output
             else:
-                function_bodies.append(completion_text.strip())
-        else:
-            # If tool_choice/function_call is provided
-            if isinstance(function_call, dict):
-                prompt += f"{function_call['name']}\n{CONTENT_TOKEN}"
-                function_call = function_call["name"]
-                function_calls.append(function_call)
-                grammar = get_grammar(function_call)
-                stops = [STOP_TOKEN, FROM_TOKEN]
-                completion = create_completion(
-                    prompt=prompt, stop=stops, grammar=grammar
+                tool = next(
+                    (tool for tool in tools if tool["function"]["name"] == output["name"])
                 )
-                completion_text = completion["choices"][0]["text"]
+                grammar = get_json_grammar(json_schema=tool["function"]["parameters"])
+                completion = create_completion(prompt=prompt, stop=stop, grammar=grammar)
+                output.update({"arguments": completion["choices"][0]["text"]})
                 completion_tokens += completion["usage"]["completion_tokens"]
-                function_bodies.append(completion_text.strip())
-            # If "auto" or no tool_choice/function_call
-            elif isinstance(function_call, str) and function_call == "auto":
-                while True:
-                    # Generate function name first
-                    grammar = None
-                    stops = CONTENT_TOKEN
-                    completion = create_completion(
-                        prompt=prompt, stop=stops, grammar=grammar
-                    )
-                    completion_text = completion["choices"][0]["text"]
-                    completion_tokens += completion["usage"]["completion_tokens"]
-                    function_name = completion_text.strip()
-                    if function_name == "all":
-                        prompt += "all\n<|content|>"
-                    else:
-                        function_call = completion_text.strip()
-                        prompt += f"{function_call}\n<|content|>"
-                        function_calls.append(function_call)
-                        grammar = get_grammar(function_call)
-                    # Generate content
-                    stops = [RECIPIENT_TOKEN, STOP_TOKEN]
-                    completion = create_completion(
-                        prompt=prompt, stop=stops, grammar=grammar
-                    )
-                    completion_text = completion["choices"][0]["text"]
-                    completion_tokens += completion["usage"]["completion_tokens"]
-                    if function_name == "all":
-                        if completion_text.endswith("\n<|from|>assistant\n"):
-                            content += completion_text[: -len("\n<|from|>assistant\n")]
-                        if completion_text.endswith("\n<|from|> assistant\n"):
-                            content += completion_text[-len("\n<|from|> assistant\n")]
-                        else:
-                            content += completion_text
-                        content = content.lstrip()
-                        # Check whether the model wants to generate another turn
-                        if (
-                            "<|from|> assistant" in completion_text
-                            or "<|from|>assistant" in completion_text
-                        ):
-                            if completion_text.endswith("\n<|from|>assistant\n"):
-                                cleaned_completion_text = completion_text[
-                                    : -len("\n<|from|>assistant\n")
-                                ].strip()
-                            elif completion_text.endswith("\n<|from|> assistant\n"):
-                                cleaned_completion_text = completion_text[
-                                    -len("\n<|from|> assistant\n")
-                                ].strip()
-                            else:
-                                cleaned_completion_text = completion_text.strip()
-                            prompt += f"{cleaned_completion_text}\n<|from|>assistant\n<|recipient|>"
-                        else:
-                            break
-                    else:
-                        function_bodies.append(completion_text.strip())
-                        # Check whether the model wants to generate another turn
-                        prompt += completion_text.strip()
-                        grammar = None
-                        completion = create_completion(
-                            prompt=prompt, stop=stops, grammar=grammar
-                        )
-                        completion_tokens += completion["usage"]["completion_tokens"]
-                        if (
-                            "<|from|> assistant" in completion["choices"][0]["text"]
-                            or "<|from|>assistant" in completion["choices"][0]["text"]
-                        ):
-                            prompt += "\n<|from|>assistant\n<|recipient|>"
-                        else:
-                            break
-
-        assert "usage" in completion
-        assert len(function_calls) == len(function_bodies)
-
-        tool_calls: List[llama_types.ChatCompletionMessageToolCall] = []
-        for function_call, function_body in zip(function_calls, function_bodies):
-            tool_calls.append(
-                {
-                    "id": "call_"
-                    + "".join(
-                        [
-                            random.choice(string.ascii_letters + string.digits)
-                            for _ in range(24)
-                        ]
-                    ),
-                    "type": "function",
-                    "function": {
-                        "name": function_call,
-                        "arguments": function_body,
-                    },
-                }
+                tool_calls.append(output)
+                prompt += completion["choices"][0]["text"]
+            # Check whether the model wants to generate another turn
+            completion = create_completion(
+                prompt=prompt, stop=None, grammar=None, max_tokens=1
             )
-
-        # TODO: support stream mode
-        function_call_dict: Union[
-            Dict[str, str],
-            Dict[
-                Literal["function_call"],
-                llama_types.ChatCompletionRequestAssistantMessageFunctionCall,
-            ],
-        ] = {}
-        if len(tool_calls) > 0:
-            if tools is not None:
-                function_call_dict["tool_calls"] = tool_calls
+            if completion["choices"][0]["text"]:
+                prompt += completion["choices"][0]["text"]
             else:
-                function_call_dict["function_call"] = {
-                    "name": tool_calls[0]["function"]["name"],
-                    "arguments": tool_calls[0]["function"]["arguments"],
-                }
-        completion["usage"]["completion_tokens"] = completion_tokens
-        return llama_types.CreateChatCompletionResponse(
-            id="chat" + completion["id"],
-            object="chat.completion",
-            created=completion["created"],
-            model=completion["model"],
-            choices=[
-                {
-                    "index": 0,
-                    "logprobs": completion["choices"][0]["logprobs"],
-                    "message": {
-                        "role": "assistant",
-                        "content": None if content == "" else content,
-                        **function_call_dict,
-                    },
-                    "finish_reason": "tool_calls" if len(tool_calls) > 0 else "stop",
-                }
-            ],
-            usage=completion["usage"],
+                break
+
+    assert "usage" in completion
+
+    tool_calls_messages: List[llama_types.ChatCompletionMessageToolCall] = []
+    for tool_call in tool_calls:
+        tool_calls_messages.append(
+            {
+                "id": "call_"
+                + "".join(
+                    [
+                        random.choice(string.ascii_letters + string.digits)
+                        for _ in range(24)
+                    ]
+                ),
+                "type": "function",
+                "function": tool_call,
+            }
         )
+
+    # TODO: support stream mode
+    tool_call_dict: Union[
+        Dict[str, str],
+        Dict[
+            Literal["function_call"],
+            llama_types.ChatCompletionRequestAssistantMessageFunctionCall,
+        ],
+    ] = {}
+    if len(tool_calls_messages) > 0:
+        if tools is not None:
+            tool_call_dict["tool_calls"] = tool_calls_messages
+        else:
+            tool_call_dict["function_call"] = {
+                "name": tool_calls_messages[0]["function"]["name"],
+                "arguments": tool_calls_messages[0]["function"]["arguments"],
+            }
+    completion["usage"]["completion_tokens"] = completion_tokens
+    return llama_types.CreateChatCompletionResponse(
+        id="chat" + completion["id"],
+        object="chat.completion",
+        created=completion["created"],
+        model=completion["model"],
+        choices=[
+            {
+                "index": 0,
+                "logprobs": completion["choices"][0]["logprobs"],
+                "message": {
+                    "role": "assistant",
+                    "content": None if content == "" else content,
+                    **tool_call_dict,
+                },
+                "finish_reason": "tool_calls" if len(tool_calls) > 0 else "stop",
+            }
+        ],
+        usage=completion["usage"],
+    )
 
 
 class Llava15ChatHandler:
